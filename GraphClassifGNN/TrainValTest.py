@@ -20,24 +20,6 @@ def is_eval_epoch(cur_epoch, eval_period, max_epoch):
     )
 
 
-def get_true_costs(loader, characteristics, device):
-    gen_index = torch.tensor(characteristics['gen_index'])
-    node_chars = torch.tensor(characteristics['nodes'].values)
-    norm_coeffs = characteristics['norm_coeffs']
-    nb_nodes = characteristics['node_nb']
-    true_costs = np.zeros(len(loader))
-    for i, data in enumerate(loader):
-        batch_size = data.num_graphs
-        true = data.y
-        true_pg = true.T[0]*norm_coeffs['P_norm']
-        true_qg = true.T[1]*norm_coeffs['Q_norm']
-        true_pg = true_pg.view(batch_size, nb_nodes).T
-        true_qg = true_qg.view(batch_size, nb_nodes).T
-        static_costs = torch.full((1,batch_size), characteristics['static_costs'].sum()).squeeze(0)
-        #print(compute_total_cost(true_pg, true_qg, gen_index, node_chars, batch_size, device))
-        true_costs[i] = compute_total_cost(true_pg,true_qg, gen_index, node_chars, batch_size, device, static_costs)
-    return true_costs
-
 #@torch.enable_grad
 def train_regr_pinn_correct(loaders,characteristics, model, optimizer, device, max_epoch, eval_period, scheduler, run, training_params, batch_size, augmented_epochs, penalty_multipliers):
     '''
@@ -78,17 +60,15 @@ def train_regr_pinn_correct(loaders,characteristics, model, optimizer, device, m
         val_loss_saver = []
 
     lambdas = init_lambda(loaders[0],characteristics, device, batch_size) # Initiates a vector full of 0 of the appropriate sizes for the AL multiplers
-    true_costs = get_true_costs(loaders[0], characteristics, device)
-    print(true_costs)
     t0 = time()
     for epoch in range(augmented_epochs):
         if run != 0 and is_eval_epoch(epoch, 10, max_epoch):
             print(" ################################ Epoch {} ################################".format(epoch))
-        penalty_multipliers, previous_loss_dict, stats = training_step_coo_lagr(loaders[0], characteristics,model, optimizer, previous_loss_dict, lambdas, penalty_multipliers, run, device, true_costs)
+        penalty_multipliers, previous_loss_dict, stats = training_step_coo_lagr(loaders[0], characteristics,model, optimizer, previous_loss_dict, lambdas, penalty_multipliers, run, device)
         #if run == 0:
         #    results_saver[epoch] += stats
         if is_eval_epoch(epoch, eval_period, max_epoch):
-            val_loss = eval_epoch_regr(loaders[1], model, device, run, characteristics)
+            #val_loss = eval_epoch_regr(loaders[1], model, device, run, characteristics)
             val_loss = 0
             if run == 0:
                 val_loss_saver.append(val_loss)   
@@ -136,6 +116,9 @@ def eval_epoch_regr(loader, model, device, run, characteristics):
     edge_limits = characteristics['edge_limits']
     G = torch.tensor(characteristics['G']).unsqueeze(1)
     B = torch.tensor(characteristics['B']).unsqueeze(1)
+    S_P = characteristics['S_P']
+    SG_Q = characteristics['SG_Q']
+    NG_V = characteristics['NG_V']
     v_target = []
     v_pred = []
     running_loss = list([0])
@@ -146,32 +129,36 @@ def eval_epoch_regr(loader, model, device, run, characteristics):
         true = data.y
         pred = model(data)
         
-        pd = data.x[:,0]*norm_coeffs['P_norm']
-        qd = data.x[:,1]*norm_coeffs['Q_norm']
-    
-        pg = pred.T[0]*norm_coeffs['P_norm']
-        qg = pred.T[1]*norm_coeffs['Q_norm']
-        V = pred.T[2,:]*norm_coeffs['V_norm']
-        Theta = pred.T[3,:]*np.pi/180*norm_coeffs['Theta_norm']
-        #print(pg)
-        #print(pd)
-        Theta = Theta.view(batch_size, nb_nodes).T[:nb_nodes]
-        V = V.view(batch_size, nb_nodes).T[:nb_nodes]
-        pg = pg.view(batch_size, nb_nodes).T
-        #print(pg)
-        qg = qg.view(batch_size, nb_nodes).T
+        # Denormalize the Outputs to properly compute the losses
+        p_in = data.x[:, 0]*norm_coeffs['P_norm']
+        q_in = data.x[:, 1]*norm_coeffs['Q_norm']
+        V_in = data.x[:, 2]*norm_coeffs['V_norm']
+        #print(p_in)
+
+        V_in = V_in.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        p_in = p_in.view(batch_size, nb_nodes).T.to(device)
+        q_in = q_in.view(batch_size, nb_nodes).T.to(device)
+
+        p_out = pred[:, 0]*norm_coeffs['P_norm']
+        q_out = pred[:, 1]*norm_coeffs['Q_norm']
+        V_out = pred[:,2]*norm_coeffs['V_norm']
+        Theta = pred[:,3]*(np.pi/180)*norm_coeffs['Theta_norm']
+
+
+        Theta = Theta.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        V_out = V_out.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        p_out = p_out.view(batch_size, nb_nodes).T.to(device)
+        q_out = q_out.view(batch_size, nb_nodes).T.to(device)
         Theta[characteristics['Ref_node'],:] = 0
-        #print(pg)
-        pd = pd.view(batch_size, nb_nodes).T[:nb_nodes]
-        qd = qd.view(batch_size, nb_nodes).T[:nb_nodes]
+
+        #We only look at the relevant quantities. The others are set to 0
+        V_out = NG_V @ V_out
+        p_out = S_P @ p_out
+        q_out = SG_Q @ q_out
+
+        V = V_out + V_in
         #print(pd)
-        #print(pg)
-        #print(qg)
-        #print(pd)
-        #print(qd)
-        #print(V)
-        #print(Theta)
-        eq_loss , flow_loss  = compute_eq_loss(pg, qg, pd, qd, V, Theta, edge_from_bus, edge_to_bus, gen_to_bus, nb_nodes, edge_nb, base_MVA, edge_limits, G, B, batch_size, device)
+        eq_loss , flow_loss  = compute_eq_loss(p_in,q_in, V, p_out,q_out, Theta, edge_from_bus, edge_to_bus, gen_to_bus, base_MVA, G, B, batch_size, device)
         #print(eq_loss)
         #Pg = (gen_to_bus @ pg).to(device)
         #plate_loss = torch.abs(pd.sum() - Pg.sum())
@@ -183,8 +170,9 @@ def eval_epoch_regr(loader, model, device, run, characteristics):
         #loss = nn.MSELoss()
         #loss = loss(pred, true)
         #running_loss[0] += loss.item()
-        v_target.append(true.detach())#.cpu())
-        v_pred.append(pred.detach())#.cpu())
+        
+        #v_target.append(true.detach())#.cpu())
+        #v_pred.append(pred.detach())#.cpu())
     #if run != 0:
         #print("Val loss:", running_loss[0] / len(loader))
     #v_target = np.concatenate(v_target, axis=0)
@@ -216,55 +204,66 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
     gen_to_bus = characteristics["gen_to_bus"]
     edge_nb = len(characteristics['actual_edges'])
     base_MVA = characteristics['norm_coeffs']['Base_MVA']
-    edge_limits = characteristics['edge_limits']
-    node_limits = characteristics['node_limits']
     gen_index = torch.tensor(characteristics['gen_index'])
     G = torch.tensor(characteristics['G']).unsqueeze(1)
     B = torch.tensor(characteristics['B']).unsqueeze(1)
-    gen_nb = len(characteristics['gen_index'])
-    node_chars = torch.tensor(characteristics['nodes'].values)
+    S_P = characteristics['S_P']
+    SG_Q = characteristics['SG_Q']
+    NG_V = characteristics['NG_V']
+
     i = 0
     running_loss = list([0])
     for data in loader:
         i += 1
         data.to(device)
         batch_size = data.num_graphs
-        true = data.y.detach()#.cpu()
-        #if i == 1:
-        print('True: ')
-        print(true)
+        #true = data.y.detach()#.cpu()
+
+        #print('True: ')
+        #print(true)
         pred = model(data)
-        for i in range(characteristics['total_node_nb']*batch_size):
-            if i%characteristics['total_node_nb'] not in characteristics['gen_index']:
-                pred.T[0][i] = 0
-                pred.T[1][i] = 0
-            if i%characteristics['total_node_nb'] > characteristics['node_nb']:
-                pred.T[2][i] = 0
-                pred.T[3][i] = 0
-
         #if i == 1:
-        pd = data.x[:,0]*norm_coeffs['P_norm']
-        qd = data.x[:,1]*norm_coeffs['Q_norm']
-        pg = pred.T[0]*norm_coeffs['P_norm']
-        qg = pred.T[1]*norm_coeffs['Q_norm']
-        V = pred.T[2,:]*norm_coeffs['V_norm']
-        Theta = pred.T[3,:]*np.pi/180*norm_coeffs['Theta_norm']
+        # Denormalize the Outputs to properly compute the losses
+        p_in = data.x[:, 0]*norm_coeffs['P_norm']
+        q_in = data.x[:, 1]*norm_coeffs['Q_norm']
+        V_in = data.x[:, 2]*norm_coeffs['V_norm']
+        print(p_in)
+        print(q_in)
+        print(V_in)
 
-        Theta = Theta.view(batch_size, nb_nodes).T[:nb_nodes]
-        V = V.view(batch_size, nb_nodes).T[:nb_nodes]
-        pg = pg.view(batch_size, nb_nodes).T
-        qg = qg.view(batch_size, nb_nodes).T
+        V_in = V_in.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        p_in = p_in.view(batch_size, nb_nodes).T.to(device)
+        q_in = q_in.view(batch_size, nb_nodes).T.to(device)
+
+        p_out = pred[:, 0]*norm_coeffs['P_norm']
+        q_out = pred[:, 1]*norm_coeffs['Q_norm']
+        V_out = pred[:,2]*norm_coeffs['V_norm']
+        Theta = pred[:,3]*(np.pi/180)*norm_coeffs['Theta_norm']
+
+
+        Theta = Theta.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        V_out = V_out.view(batch_size, nb_nodes).T[:nb_nodes].to(device)
+        p_out = p_out.view(batch_size, nb_nodes).T.to(device)
+        q_out = q_out.view(batch_size, nb_nodes).T.to(device)
         Theta[characteristics['Ref_node'],:] = 0
 
+        #We only look at the relevant quantities. The others are set to 0
+        V_out = NG_V @ V_out
+        p_out = S_P @ p_out
+        q_out = SG_Q @ q_out
+
+        V = V_out + V_in
+
         print('Prediction: ')
-        print(pred)
+        #print(pred)
+        print(p_out.T)
+        print(q_out.T)
+        print(V_out.T)
+        print(Theta.T)
 
-        pd = pd.view(batch_size, nb_nodes).T[:nb_nodes]
-        qd = qd.view(batch_size, nb_nodes).T[:nb_nodes]
-
-        loss = nn.MSELoss()
-        loss = loss(pred, true)
-        running_loss[0] += loss.item()
+        #loss = nn.MSELoss()
+        #loss = loss(pred, true)
+        #running_loss[0] += loss.item()
         
         #print(pg)
         #print(pd)
@@ -273,9 +272,8 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
         #print('Theta')
         #print(Theta)
         
-        eq_loss , flow_loss  = compute_eq_loss(pg, qg, pd, qd, V, Theta, edge_from_bus, edge_to_bus, gen_to_bus, nb_nodes, edge_nb, base_MVA, edge_limits, G, B, batch_size, device) #We probably want to change this to get a better spread
+        eq_loss = compute_eq_loss(p_in,q_in, V, p_out,q_out, Theta, edge_from_bus, edge_to_bus, gen_to_bus, base_MVA, G, B, batch_size, device) #We probably want to change this to get a better spread
         #plate_loss = torch.abs(torch.sum(pd) - pg[0] - pg[1] - pg[2])
-        cost_loss = compute_total_cost(pg,qg, gen_index, node_chars, batch_size, device, static_costs)
         #print(true.T[0]*norm_coeffs['P_norm']) #true active power in MW
 
         #print(true_cost)
@@ -283,11 +281,11 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
         eq_losses.append(abs(eq_loss).detach().sum())
         
 
-        trues.append(pand.DataFrame(true.detach().numpy()))
+        #trues.append(pand.DataFrame(true.detach().numpy()))
         preds.append(pand.DataFrame(pred.detach().numpy()))
 
         #print('Test part')
-
+        """
         #eq_loss_true_2 , flow_loss_true, plate_loss_true  = compute_eq_loss_list(true.T[0]*norm_coeffs['P_norm'], pd, true.T[1]*norm_coeffs['Q_norm'], qd, true.T[2]*norm_coeffs['V_norm'], true.T[3]*np.pi/180*norm_coeffs['Theta_norm'], characteristics, batch_size, device)
         true_pg = true.T[0]*norm_coeffs['P_norm']
         true_qg = true.T[1]*norm_coeffs['Q_norm']
@@ -303,20 +301,17 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
         #print(true_pg)
         #print(pg)
         
-        eq_loss_true , flow_loss_true = compute_eq_loss(true_pg, true_qg, pd, qd, true_V, true_Theta, edge_from_bus, edge_to_bus, gen_to_bus, nb_nodes, edge_nb, base_MVA, edge_limits, G, B, batch_size, device)
-        true_cost = compute_total_cost(true_pg,true_qg, gen_index, node_chars, batch_size, device, static_costs)
+        eq_loss_true , flow_loss_true = compute_eq_loss(p_in,q_in, V, p_out,q_out, Theta, edge_from_bus, edge_to_bus, gen_to_bus, base_MVA, G, B, batch_size, device)
 
         #print(eq_loss_true)
         #print(eq_loss_true_2)
 
         #print(eq_loss_true)
         print('True Eq loss: ' + str(abs(eq_loss_true).detach().sum()))
-        cost_differences.append(torch.abs(cost_loss.detach() - true_cost.detach()))
-        print('True cost: ' + str(true_cost.detach().sum()))
-        print('Model cost: ' + str(cost_loss.detach().sum()))
         #print(abs(eq_loss_true_2).detach().sum())
         #print('True Flow loss: ' + str(abs(flow_loss_true).detach().sum()))
         true_eq_losses.append(abs(eq_loss_true).detach().sum())
+        """
     
     avg_true_eq_loss = np.mean(np.array(true_eq_losses))
     avg_eq_loss = np.mean(np.array(eq_losses))
@@ -329,7 +324,7 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
 
     #print(eq_losses)
 
-    trues = pand.concat(trues)
+    #trues = pand.concat(trues)
     preds = pand.concat(preds)
 
     print(eq_losses)
@@ -337,10 +332,10 @@ def test_epoch_regr_pinn(loader, model, device, characteristics, run): #
 
     print('Average MSE Loss: ' + str(running_loss[0] / len(loader)))
 
-    relevant_results_saver = pand.DataFrame(data = np.array([eq_losses, cost_differences]), index = ['eq_losses', 'cost_differences'])
-    pand.DataFrame.to_csv(relevant_results_saver, 'Results/relevant_results.csv')
+    #relevant_results_saver = pand.DataFrame(data = np.array([eq_losses, cost_differences]), index = ['eq_losses', 'cost_differences'])
+    #pand.DataFrame.to_csv(relevant_results_saver, 'Results/relevant_results.csv')
 
-    pand.DataFrame.to_csv(trues, 'Results/true.csv')
+    #pand.DataFrame.to_csv(trues, 'Results/true.csv')
     pand.DataFrame.to_csv(preds, 'Results/pred.csv')
 
     torch.save(model, 'Results/model.pt')

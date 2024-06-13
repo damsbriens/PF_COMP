@@ -125,7 +125,7 @@ class NetGAT(nn.Module):
         
         #mlp = self.readout(x1)
         
-        mlp = self.readout(x3)
+        mlp = self.readout(x2)
         return mlp
 
 class NetGATmulti(nn.Module):

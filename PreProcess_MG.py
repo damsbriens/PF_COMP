@@ -79,6 +79,22 @@ case_prods = [1,2,5,5,7,0]
 case_v_correction = 5
 case_slack = 6
 
+#Useful matrices for PF computations - all diagnoal matrices:
+S_P = torch.zeros((nb_nodes, nb_nodes)) #Slack bus for P_out
+SG_Q = torch.zeros((nb_nodes, nb_nodes)) #Slack and Gen for Q_out
+NG_V = torch.zeros((nb_nodes, nb_nodes)) # Non-Generator and non-slack for V
+
+S_P[case_slack][case_slack] = 1
+SG_Q[case_slack][case_slack] = 1
+
+for i in case_prods:
+    SG_Q[i][i] = 1
+
+for j in range(nb_nodes):
+    if j not in case_prods:
+        NG_V[j][j] = 1
+
+NG_V[case_slack][case_slack] = 0
 
 types = torch.zeros(nb_nodes)
 
@@ -136,22 +152,24 @@ net_p = prod_p - load_p
 index = torch.arange(nb_nodes) * 0.01
 hash = torch.full((nb_nodes,), 0.0002 * prod_p.sum())
 
+#print(prod_v)
 
 V_norm = 1000 #Structure here is not efficient. Is kept this way in case we want to change norms
 P_norm = 200
 Q_norm = 100
-norm_coeffs = {'V_norm': 11, 'P_norm': P_norm, 'Q_norm': Q_norm, 'Theta_norm': 360., 'Base_MVA': Base_MVA}
+norm_coeffs = {'V_norm': V_norm, 'P_norm': P_norm, 'Q_norm': Q_norm, 'Theta_norm': 360., 'Base_MVA': Base_MVA}
 
 
 
 
 
 input = torch.stack([net_p/P_norm, load_q/Q_norm ,prod_v/V_norm, types*0.1, index, hash]).T
-print(input)
+
 #print(types)
 
-inputs = torch.zeros((points, nb_nodes, 6))
-inputs[0] = input
+inputs = []#torch.zeros((points, nb_nodes, 6))
+inputs.append([input])
+#print(inputs)
 
 edge_index = torch.tensor(edge_index, dtype=torch.long)
 
@@ -188,7 +206,7 @@ if points < 10:
 
 
 
-characteristics = {'node_nb': nb_nodes , 'edge_limits': edge_limits, 'actual_edges': actual_edges, 'G': G, 'B': B, 'norm_coeffs': norm_coeffs, 'Ref_node': case_slack , 'gen_index': case_prods, 'gen_to_bus': prods_to_bus, 'edge_to_bus': edge_to_bus}
+characteristics = {'node_nb': nb_nodes , 'edge_limits': edge_limits, 'actual_edges': actual_edges, 'G': G, 'B': B, 'norm_coeffs': norm_coeffs, 'Ref_node': case_slack , 'gen_index': case_prods, 'gen_to_bus': prods_to_bus, 'edge_to_bus': edge_to_bus, 'S_P': S_P, 'SG_Q': SG_Q, 'NG_V': NG_V}
 characteristics['static_cost'] = mpc['gencost'].T[6].sum()
 
 print('Saving {}_{}_{}'.format(case, points, batch))
